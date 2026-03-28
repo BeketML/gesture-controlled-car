@@ -1,5 +1,9 @@
 # OpenCV: захват с камеры и рисование поверх кадра
 import math
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import cv2
 import mediapipe as mp
 import serial
@@ -16,7 +20,17 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 OPEN_PALM_MIN_FINGERS = 4
 CLOSED_FIST_MAX_FINGERS = 1
 # Правая рука: наклон ладони в градусах (мертвая зона по центру = «прямо»)
-STEER_DEAD_ZONE_DEG = 14.0
+STEER_DEAD_ZONE_DEG = 10.0
+# Правая рука опущена вниз по кадру (нормализованный y): газ + это -> назад (State=B)
+RIGHT_HAND_REVERSE_Y_MIN = 0.5
+
+# --- Wi-Fi: ESP8266 в режиме AP (firmware/esp32_car_drive_server.ino) ---
+# Ноут подключается к точке (ssid в прошивке), обычно базовый URL: http://192.168.4.1
+# Команды: GET /?State=F|G|I|S|... как в HTTP_handleRoot на машинке.
+CAR_WIFI_ENABLED = False
+CAR_WIFI_BASE_URL = "http://192.168.0.15"
+CAR_WIFI_HEARTBEAT_SEC = 0.35
+CAR_WIFI_TIMEOUT_SEC = 0.35
 
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -75,11 +89,69 @@ def classify_steering(landmarks):
     return "center", ang
 
 
+def is_right_hand_lowered(landmarks) -> bool:
+    """True, если правая рука низко в кадре (газ слева + это -> только назад B)."""
+    lm0, lm9 = landmarks[0], landmarks[9]
+    y_mean = (lm0.y + lm9.y) / 2.0
+    return y_mean >= RIGHT_HAND_REVERSE_Y_MIN
+
+
 def handedness_label(handedness_list):
     """Из результата MediaPipe: 'Left' или 'Right' (первая категория с макс. score)."""
     if not handedness_list:
         return None
     return handedness_list[0].category_name
+
+
+def compute_drive_mode(left_seen, left_state, right_seen, right_steer, right_lowered):
+    """
+    Логический режим (HUD). На машину — drive_mode_to_car_state:
+    STOP->S, FWD*->F/G/I, REV (опущенная правая + газ)->B.
+    """
+    if not left_seen or left_state == "brake":
+        return "STOP"
+    if left_state == "neutral":
+        return "STOP"
+    if right_seen and right_lowered:
+        return "REV"
+    if not right_seen:
+        return "FWD"
+    if right_steer == "left":
+        return "FWD_L"
+    if right_steer == "right":
+        return "FWD_R"
+    return "FWD"
+
+
+def drive_mode_to_car_state(mode: str) -> str:
+    """Соответствие логического режима прошивке L298N / ESP8266WebServer (параметр State)."""
+    return {
+        "STOP": "S",
+        "FWD": "F",
+        "FWD_L": "G",
+        "FWD_R": "I",
+        "REV": "B",
+    }.get(mode, "S")
+
+
+def send_drive_to_car(base_url: str, mode: str, timeout_sec: float) -> tuple[bool, str]:
+    """GET {base}/?State=<буква> — как в esp32_car_drive_server.ino (HTTP_handleRoot)."""
+    state = drive_mode_to_car_state(mode)
+    url = base_url.rstrip("/") + "/?" + urllib.parse.urlencode({"State": state})
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if resp.status == 200:
+                return True, "ok"
+            return False, f"http {resp.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"http {e.code}"
+    except urllib.error.URLError:
+        return False, "net err"
+    except TimeoutError:
+        return False, "timeout"
+    except Exception:
+        return False, "err"
 
 
 def draw_hand_landmarks_bgr(img, landmarks, h, w):
@@ -90,7 +162,16 @@ def draw_hand_landmarks_bgr(img, landmarks, h, w):
         cv2.circle(img, pt, 3, (0, 255, 0), -1)
 
 
-def draw_drive_hud(img, left_state, right_steer, steer_angle_deg, left_seen, right_seen):
+def draw_drive_hud(
+    img,
+    left_state,
+    right_steer,
+    steer_angle_deg,
+    left_seen,
+    right_seen,
+    drive_mode=None,
+    wifi_line=None,
+):
     """
     Панель состояний (латиница — стандартный шрифт OpenCV не рисует кириллицу).
     left_state: 'gas' | 'brake' | 'neutral' | None
@@ -98,7 +179,7 @@ def draw_drive_hud(img, left_state, right_steer, steer_angle_deg, left_seen, rig
     """
     h, w = img.shape[:2]
     overlay = img.copy()
-    panel_h = 120
+    panel_h = 138
     cv2.rectangle(overlay, (0, 0), (w, panel_h), (30, 30, 30), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
 
@@ -141,9 +222,9 @@ def draw_drive_hud(img, left_state, right_steer, steer_angle_deg, left_seen, rig
             cv2.LINE_AA,
         )
 
-    # Мини-индикатор «руля»: стрелка внизу панели
+    # Мини-индикатор «руля»
     cx = w // 2
-    base_y = panel_h - 12
+    base_y = panel_h - 28
     cv2.line(img, (cx - 60, base_y), (cx + 60, base_y), (80, 80, 80), 2)
     if right_seen and right_steer == "left":
         tip = (cx - 45, base_y)
@@ -153,6 +234,30 @@ def draw_drive_hud(img, left_state, right_steer, steer_angle_deg, left_seen, rig
         tip = (cx, base_y - 18)
     cv2.line(img, (cx, base_y), tip, (0, 200, 255), 2)
     cv2.circle(img, tip, 5, (0, 200, 255), -1)
+
+    if drive_mode is not None:
+        cv2.putText(
+            img,
+            f"CMD: {drive_mode}",
+            (10, panel_h - 8),
+            font,
+            0.5,
+            (180, 255, 180),
+            1,
+            cv2.LINE_AA,
+        )
+    if wifi_line:
+        wx = max(220, w // 2 - 60)
+        cv2.putText(
+            img,
+            wifi_line[:52],
+            (wx, panel_h - 8),
+            font,
+            0.45,
+            (200, 200, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -170,6 +275,9 @@ options = HandLandmarkerOptions(
 )
 
 frame_timestamp_ms = 0
+_last_drive_mode = None
+_last_wifi_send_time = 0.0
+_wifi_hud = ""
 
 with HandLandmarker.create_from_options(options) as landmarker:
     while True:
@@ -189,6 +297,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
         steer_angle_deg = None
         left_seen = False
         right_seen = False
+        right_lowered = False
 
         if result.hand_landmarks:
             n = len(result.hand_landmarks)
@@ -205,12 +314,38 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 elif label == "Right":
                     right_seen = True
                     right_steer, steer_angle_deg = classify_steering(hand_lms)
+                    right_lowered = is_right_hand_lowered(hand_lms)
 
-        draw_drive_hud(img, left_state, right_steer, steer_angle_deg, left_seen, right_seen)
+        drive_mode = compute_drive_mode(
+            left_seen, left_state, right_seen, right_steer, right_lowered
+        )
 
-        # Primer dlya Arduino (raskomentiruyte i zamenite COM):
-        # cmd = f"L:{left_state or 'na'};R:{right_steer or 'na'};\n"
-        # uart.write(cmd.encode("utf-8"))
+        if CAR_WIFI_ENABLED and CAR_WIFI_BASE_URL:
+            now = time.monotonic()
+            if (
+                drive_mode != _last_drive_mode
+                or (now - _last_wifi_send_time) >= CAR_WIFI_HEARTBEAT_SEC
+            ):
+                _, note = send_drive_to_car(
+                    CAR_WIFI_BASE_URL, drive_mode, CAR_WIFI_TIMEOUT_SEC
+                )
+                _last_drive_mode = drive_mode
+                _last_wifi_send_time = now
+                _wifi_hud = f"WiFi: {note}"
+        else:
+            _wifi_hud = "WiFi: off"
+
+        car_state = drive_mode_to_car_state(drive_mode)
+        draw_drive_hud(
+            img,
+            left_state,
+            right_steer,
+            steer_angle_deg,
+            left_seen,
+            right_seen,
+            drive_mode=f"{drive_mode} State={car_state}",
+            wifi_line=_wifi_hud,
+        )
 
         cv2.imshow("Image", img)
         if cv2.waitKey(1) == ord("q"):
