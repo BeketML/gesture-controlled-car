@@ -21,16 +21,33 @@ OPEN_PALM_MIN_FINGERS = 4
 CLOSED_FIST_MAX_FINGERS = 1
 # Правая рука: наклон ладони в градусах (мертвая зона по центру = «прямо»)
 STEER_DEAD_ZONE_DEG = 10.0
-# Правая рука опущена вниз по кадру (нормализованный y): газ + это -> назад (State=B)
-RIGHT_HAND_REVERSE_Y_MIN = 0.5
+# НАЗАД (REV -> State=B): левая ладонь ОТКРЫТА (газ) + правая рука в кадре и ОПУЩЕНА вниз по картинке.
+# В координатах MediaPipe y=0 верх кадра, y=1 низ. Чем ниже рука на экране, тем больше y.
+# Срабатывает, если max(y запястья, y осн. среднего) >= порога (подстройте по HUD строке R y=...).
+RIGHT_HAND_REVERSE_Y_MIN = 0.70
 
 # --- Wi-Fi: ESP8266 в режиме AP (firmware/esp32_car_drive_server.ino) ---
 # Ноут подключается к точке (ssid в прошивке), обычно базовый URL: http://192.168.4.1
 # Команды: GET /?State=F|G|I|S|... как в HTTP_handleRoot на машинке.
-CAR_WIFI_ENABLED = False
+CAR_WIFI_ENABLED = True
 CAR_WIFI_BASE_URL = "http://192.168.0.15"
 CAR_WIFI_HEARTBEAT_SEC = 0.35
 CAR_WIFI_TIMEOUT_SEC = 0.35
+
+# ---------------------------------------------------------------------------
+# Serial (опционально): та же буква состояния шлётся в COM-порт.
+# ---------------------------------------------------------------------------
+CAR_SERIAL_ENABLED = False
+CAR_SERIAL_PORT = "COM4"
+CAR_SERIAL_BAUD = 9600
+
+_KEY_FWD        = {ord('w'), ord('W'), 2490368}
+_KEY_REV        = {ord('s'), ord('S'), 2621440}
+_KEY_LEFT       = {ord('a'), ord('A'), 2424832}
+_KEY_RIGHT      = {ord('d'), ord('D'), 2555904}
+_KEY_STOP       = {ord(' ')}
+_KEY_QUIT       = ord('q')
+_KEY_TIMEOUT_SEC = 0.1
 
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -43,13 +60,13 @@ HAND_CONNECTIONS = (
 
 
 def _dist(a, b):
-    return abs(a - b)
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def count_extended_fingers(landmarks):
-    """Сколько пальцев «выпрямлены» (та же геометрия, что в старом коде, координаты y нормализованные 0..1)."""
-    p = [lm.y for lm in landmarks]
-    distance_good = _dist(p[0], p[5]) + (_dist(p[0], p[5]) / 2)
+    """Сколько пальцев «выпрямлены» (2D Euclidean distance по x и y)."""
+    p = [(lm.x, lm.y) for lm in landmarks]
+    distance_good = _dist(p[0], p[5]) * 1.5
     f1 = 1 if _dist(p[0], p[8]) > distance_good else 0
     f2 = 1 if _dist(p[0], p[12]) > distance_good else 0
     f3 = 1 if _dist(p[0], p[16]) > distance_good else 0
@@ -89,11 +106,11 @@ def classify_steering(landmarks):
     return "center", ang
 
 
-def is_right_hand_lowered(landmarks) -> bool:
-    """True, если правая рука низко в кадре (газ слева + это -> только назад B)."""
+def right_hand_lower_metrics(landmarks):
+    """y_low = насколько рука низко в кадре (0..1); lowered = True если достигли порога назад."""
     lm0, lm9 = landmarks[0], landmarks[9]
-    y_mean = (lm0.y + lm9.y) / 2.0
-    return y_mean >= RIGHT_HAND_REVERSE_Y_MIN
+    y_low = max(lm0.y, lm9.y)
+    return y_low, y_low >= RIGHT_HAND_REVERSE_Y_MIN
 
 
 def handedness_label(handedness_list):
@@ -171,6 +188,9 @@ def draw_drive_hud(
     right_seen,
     drive_mode=None,
     wifi_line=None,
+    right_lowered=False,
+    right_y_low=None,
+    kb_mode=None,
 ):
     """
     Панель состояний (латиница — стандартный шрифт OpenCV не рисует кириллицу).
@@ -179,7 +199,7 @@ def draw_drive_hud(
     """
     h, w = img.shape[:2]
     overlay = img.copy()
-    panel_h = 138
+    panel_h = 158
     cv2.rectangle(overlay, (0, 0), (w, panel_h), (30, 30, 30), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
 
@@ -209,12 +229,26 @@ def draw_drive_hud(
     else:
         cv2.putText(img, "  --- (net v kadre)", (x0, y), font, 0.65, (120, 120, 120), 1, cv2.LINE_AA)
 
+    if right_seen and right_y_low is not None:
+        y_dbg = y + 22
+        col = (0, 200, 255) if right_lowered else (140, 140, 140)
+        cv2.putText(
+            img,
+            f"  R y_low={right_y_low:.2f} need>={RIGHT_HAND_REVERSE_Y_MIN:.2f} back={'ON' if right_lowered else 'no'}",
+            (x0, y_dbg),
+            font,
+            0.45,
+            col,
+            1,
+            cv2.LINE_AA,
+        )
+
     # Угол наклона правой ладони (если была в кадре)
     if right_seen and steer_angle_deg is not None:
         cv2.putText(
             img,
             f"tilt: {steer_angle_deg:+.1f} deg",
-            (x0, y + 28),
+            (x0, y + 48),
             font,
             0.5,
             (160, 160, 255),
@@ -222,28 +256,47 @@ def draw_drive_hud(
             cv2.LINE_AA,
         )
 
-    # Мини-индикатор «руля»
+    # Мини-индикатор «руля» или стрелка НАЗАД
     cx = w // 2
-    base_y = panel_h - 28
-    cv2.line(img, (cx - 60, base_y), (cx + 60, base_y), (80, 80, 80), 2)
-    if right_seen and right_steer == "left":
+    base_y = panel_h - 32
+    is_rev = isinstance(drive_mode, str) and "REV" in drive_mode
+    if not is_rev:
+        cv2.line(img, (cx - 60, base_y), (cx + 60, base_y), (80, 80, 80), 2)
+    if is_rev:
+        cv2.arrowedLine(img, (cx, base_y - 20), (cx, base_y + 8), (0, 140, 255), 3, tipLength=0.35)
+        cv2.putText(
+            img,
+            "BACK",
+            (cx - 28, base_y - 26),
+            font,
+            0.6,
+            (0, 140, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    elif right_seen and right_steer == "left":
         tip = (cx - 45, base_y)
+        cv2.line(img, (cx, base_y), tip, (0, 200, 255), 2)
+        cv2.circle(img, tip, 5, (0, 200, 255), -1)
     elif right_seen and right_steer == "right":
         tip = (cx + 45, base_y)
-    else:
+        cv2.line(img, (cx, base_y), tip, (0, 200, 255), 2)
+        cv2.circle(img, tip, 5, (0, 200, 255), -1)
+    elif right_seen:
         tip = (cx, base_y - 18)
-    cv2.line(img, (cx, base_y), tip, (0, 200, 255), 2)
-    cv2.circle(img, tip, 5, (0, 200, 255), -1)
+        cv2.line(img, (cx, base_y), tip, (0, 200, 255), 2)
+        cv2.circle(img, tip, 5, (0, 200, 255), -1)
 
     if drive_mode is not None:
+        cmd_color = (0, 200, 255) if (isinstance(drive_mode, str) and "REV" in drive_mode) else (180, 255, 180)
         cv2.putText(
             img,
             f"CMD: {drive_mode}",
             (10, panel_h - 8),
             font,
-            0.5,
-            (180, 255, 180),
-            1,
+            0.55,
+            cmd_color,
+            2 if (isinstance(drive_mode, str) and "REV" in drive_mode) else 1,
             cv2.LINE_AA,
         )
     if wifi_line:
@@ -258,6 +311,16 @@ def draw_drive_hud(
             1,
             cv2.LINE_AA,
         )
+
+    if kb_mode is not None:
+        kb_text = f"KB: {kb_mode}"
+        kb_color = (0, 255, 255)
+        kb_weight = 2
+    else:
+        kb_text = "WASD/arrows=KB override"
+        kb_color = (80, 80, 80)
+        kb_weight = 1
+    cv2.putText(img, kb_text, (w - 230, panel_h - 8), font, 0.45, kb_color, kb_weight, cv2.LINE_AA)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -274,10 +337,12 @@ options = HandLandmarkerOptions(
     num_hands=2,
 )
 
-frame_timestamp_ms = 0
+_start_time_ms = int(time.monotonic() * 1000)
 _last_drive_mode = None
 _last_wifi_send_time = 0.0
 _wifi_hud = ""
+_key_drive_mode = None
+_key_last_press = 0.0
 
 with HandLandmarker.create_from_options(options) as landmarker:
     while True:
@@ -285,11 +350,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
         if not good:
             break
 
+        img = cv2.flip(img, 1)
         h, w = img.shape[:2]
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
 
-        frame_timestamp_ms += 33
+        frame_timestamp_ms = int(time.monotonic() * 1000) - _start_time_ms
         result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
 
         left_state = None
@@ -298,6 +364,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
         left_seen = False
         right_seen = False
         right_lowered = False
+        right_y_low = None
 
         if result.hand_landmarks:
             n = len(result.hand_landmarks)
@@ -314,11 +381,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 elif label == "Right":
                     right_seen = True
                     right_steer, steer_angle_deg = classify_steering(hand_lms)
-                    right_lowered = is_right_hand_lowered(hand_lms)
+                    right_y_low, right_lowered = right_hand_lower_metrics(hand_lms)
 
-        drive_mode = compute_drive_mode(
+        gesture_mode = compute_drive_mode(
             left_seen, left_state, right_seen, right_steer, right_lowered
         )
+        drive_mode = _key_drive_mode if _key_drive_mode is not None else gesture_mode
 
         if CAR_WIFI_ENABLED and CAR_WIFI_BASE_URL:
             now = time.monotonic()
@@ -345,11 +413,34 @@ with HandLandmarker.create_from_options(options) as landmarker:
             right_seen,
             drive_mode=f"{drive_mode} State={car_state}",
             wifi_line=_wifi_hud,
+            right_lowered=right_lowered,
+            right_y_low=right_y_low,
+            kb_mode=_key_drive_mode,
         )
 
         cv2.imshow("Image", img)
-        if cv2.waitKey(1) == ord("q"):
+
+        key = cv2.waitKeyEx(1)
+        if key == _KEY_QUIT:
             break
+        elif key in _KEY_FWD:
+            _key_drive_mode = "FWD"
+            _key_last_press = time.monotonic()
+        elif key in _KEY_REV:
+            _key_drive_mode = "REV"
+            _key_last_press = time.monotonic()
+        elif key in _KEY_LEFT:
+            _key_drive_mode = "FWD_L"
+            _key_last_press = time.monotonic()
+        elif key in _KEY_RIGHT:
+            _key_drive_mode = "FWD_R"
+            _key_last_press = time.monotonic()
+        elif key in _KEY_STOP:
+            _key_drive_mode = "STOP"
+            _key_last_press = time.monotonic()
+
+        if _key_drive_mode is not None and (time.monotonic() - _key_last_press) > _KEY_TIMEOUT_SEC:
+            _key_drive_mode = None
 
 camera.release()
 cv2.destroyAllWindows()

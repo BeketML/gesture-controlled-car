@@ -9,7 +9,7 @@
 #include <WiFiClient.h> 
 #include <ESP8266WebServer.h>
 
-String command;             //String to store app command state.
+String command = "S";       //String to store app command state.
 int speedCar = 800;         // 400 - 1023.
 int speed_Coeff = 3;
 
@@ -39,7 +39,7 @@ void setup() {
  // Starting WEB-server 
      server.on ( "/", HTTP_handleRoot );
      server.onNotFound ( HTTP_handleRoot );
-     server.begin();    
+     server.begin();
 }
 
 void goAhead(){ 
@@ -134,17 +134,15 @@ void stopRobot(){
 
       digitalWrite(IN_1, LOW);
       digitalWrite(IN_2, LOW);
-      analogWrite(ENA, speedCar);
+      analogWrite(ENA, 0);
 
       digitalWrite(IN_3, LOW);
       digitalWrite(IN_4, LOW);
-      analogWrite(ENB, speedCar);
+      analogWrite(ENB, 0);
  }
 
 void loop() {
     server.handleClient();
-    goAhead();
-    command = server.arg("State");
     if (command == "F") goAhead();
     else if (command == "B") goBack();
     else if (command == "L") goLeft();
@@ -163,13 +161,14 @@ void loop() {
     else if (command == "7") speedCar = 890;
     else if (command == "8") speedCar = 960;
     else if (command == "9") speedCar = 1023;
-    else if (command == "S") stopRobot();
+    else stopRobot();
 }
 
 void HTTP_handleRoot(void) {
-  if( server.hasArg("State") ){
-       Serial.println(server.arg("State"));
+  if (server.hasArg("State")) {
+    command = server.arg("State");
+    Serial.println(command);
   }
-  server.send ( 200, "text/html", "" );
+  server.send(200, "text/html", "");
   delay(1);
 }
