@@ -15,16 +15,9 @@ HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-# --- Пороги управления (подстройте под камеру и расстояние) ---
-# Левая рука: сколько пальцев считать «открытой ладонью» (газ) / «кулаком» (тормоз)
-OPEN_PALM_MIN_FINGERS = 4
-CLOSED_FIST_MAX_FINGERS = 1
-# Правая рука: наклон ладони в градусах (мертвая зона по центру = «прямо»)
+# --- Пороги управления ---
+# Правая рука: мертвая зона поворота в градусах
 STEER_DEAD_ZONE_DEG = 10.0
-# НАЗАД (REV -> State=B): левая ладонь ОТКРЫТА (газ) + правая рука в кадре и ОПУЩЕНА вниз по картинке.
-# В координатах MediaPipe y=0 верх кадра, y=1 низ. Чем ниже рука на экране, тем больше y.
-# Срабатывает, если max(y запястья, y осн. среднего) >= порога (подстройте по HUD строке R y=...).
-RIGHT_HAND_REVERSE_Y_MIN = 0.70
 
 # --- Wi-Fi: ESP8266 в режиме AP (firmware/esp32_car_drive_server.ino) ---
 # Ноут подключается к точке (ssid в прошивке), обычно базовый URL: http://192.168.4.1
@@ -63,25 +56,36 @@ def _dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def count_extended_fingers(landmarks):
-    """Сколько пальцев «выпрямлены» (2D Euclidean distance по x и y)."""
-    p = [(lm.x, lm.y) for lm in landmarks]
-    distance_good = _dist(p[0], p[5]) * 1.5
-    f1 = 1 if _dist(p[0], p[8]) > distance_good else 0
-    f2 = 1 if _dist(p[0], p[12]) > distance_good else 0
-    f3 = 1 if _dist(p[0], p[16]) > distance_good else 0
-    f4 = 1 if _dist(p[0], p[20]) > distance_good else 0
-    f0 = 1 if _dist(p[4], p[17]) > distance_good else 0
-    return f0 + f1 + f2 + f3 + f4
+def fingers_up(landmarks):
+    """
+    Возвращает [index, middle, ring, pinky] — True если палец выпрямлен.
+    Кончик выше (меньше y) среднего сустава в координатах MediaPipe.
+    """
+    p = [lm.y for lm in landmarks]
+    return [
+        p[8]  < p[6],
+        p[12] < p[10],
+        p[16] < p[14],
+        p[20] < p[18],
+    ]
 
 
-def classify_hand_openness(landmarks):
-    """Левая рука: открытая ладонь = газ, кулак = тормоз, между = нейтраль."""
-    n = count_extended_fingers(landmarks)
-    if n <= CLOSED_FIST_MAX_FINGERS:
+def classify_left_gesture(landmarks):
+    """
+    Жесты левой руки (по 4 пальцам: указательный, средний, безымянный, мизинец):
+
+      Кулак          [0,0,0,0] -> 'brake'   -> STOP
+      Открытая ладонь[1,1,1,1] -> 'gas'     -> FORWARD
+      Рога           [1,0,0,1] -> 'reverse' -> BACK
+      Всё остальное            -> 'neutral'  -> STOP
+    """
+    idx, mid, rng, pin = fingers_up(landmarks)
+    if not idx and not mid and not rng and not pin:
         return "brake"
-    if n >= OPEN_PALM_MIN_FINGERS:
+    if idx and mid and rng and pin:
         return "gas"
+    if idx and not mid and not rng and pin:
+        return "reverse"
     return "neutral"
 
 
@@ -106,12 +110,6 @@ def classify_steering(landmarks):
     return "center", ang
 
 
-def right_hand_lower_metrics(landmarks):
-    """y_low = насколько рука низко в кадре (0..1); lowered = True если достигли порога назад."""
-    lm0, lm9 = landmarks[0], landmarks[9]
-    y_low = max(lm0.y, lm9.y)
-    return y_low, y_low >= RIGHT_HAND_REVERSE_Y_MIN
-
 
 def handedness_label(handedness_list):
     """Из результата MediaPipe: 'Left' или 'Right' (первая категория с макс. score)."""
@@ -120,16 +118,17 @@ def handedness_label(handedness_list):
     return handedness_list[0].category_name
 
 
-def compute_drive_mode(left_seen, left_state, right_seen, right_steer, right_lowered):
+def compute_drive_mode(left_seen, left_state, right_seen, right_steer):
     """
-    Логический режим (HUD). На машину — drive_mode_to_car_state:
-    STOP->S, FWD*->F/G/I, REV (опущенная правая + газ)->B.
+    Логический режим. Жесты левой руки:
+      Кулак          -> STOP
+      Открытая ладонь -> FWD (+ поворот правой)
+      Рога (index+pinky) -> REV
+      Нейтраль       -> STOP
     """
-    if not left_seen or left_state == "brake":
+    if not left_seen or left_state in ("brake", "neutral"):
         return "STOP"
-    if left_state == "neutral":
-        return "STOP"
-    if right_seen and right_lowered:
+    if left_state == "reverse":
         return "REV"
     if not right_seen:
         return "FWD"
@@ -188,13 +187,11 @@ def draw_drive_hud(
     right_seen,
     drive_mode=None,
     wifi_line=None,
-    right_lowered=False,
-    right_y_low=None,
     kb_mode=None,
 ):
     """
     Панель состояний (латиница — стандартный шрифт OpenCV не рисует кириллицу).
-    left_state: 'gas' | 'brake' | 'neutral' | None
+    left_state: 'gas' | 'brake' | 'reverse' | 'neutral' | None
     right_steer: 'left' | 'center' | 'right' | None
     """
     h, w = img.shape[:2]
@@ -205,16 +202,18 @@ def draw_drive_hud(
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     y = 28
-    cv2.putText(img, "LEFT hand (gas/brake):", (10, y), font, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(img, "LEFT (roga=BACK palma=FWD kulak=STOP):", (10, y), font, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
     y += 26
     if left_seen and left_state == "gas":
-        cv2.putText(img, "  GAZ", (10, y), font, 0.7, (0, 255, 100), 2, cv2.LINE_AA)
+        cv2.putText(img, "  PALMA -> FORWARD", (10, y), font, 0.65, (0, 255, 100), 2, cv2.LINE_AA)
+    elif left_seen and left_state == "reverse":
+        cv2.putText(img, "  ROGA  -> BACK", (10, y), font, 0.65, (0, 140, 255), 2, cv2.LINE_AA)
     elif left_seen and left_state == "brake":
-        cv2.putText(img, "  TORMOZ", (10, y), font, 0.7, (0, 80, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, "  KULAK -> STOP", (10, y), font, 0.65, (0, 60, 255), 2, cv2.LINE_AA)
     elif left_seen and left_state == "neutral":
-        cv2.putText(img, "  NEYTRAL", (10, y), font, 0.7, (200, 200, 100), 2, cv2.LINE_AA)
+        cv2.putText(img, "  (neytral) -> STOP", (10, y), font, 0.6, (200, 200, 100), 1, cv2.LINE_AA)
     else:
-        cv2.putText(img, "  --- (net v kadre)", (10, y), font, 0.65, (120, 120, 120), 1, cv2.LINE_AA)
+        cv2.putText(img, "  --- (net v kadre)", (10, y), font, 0.6, (120, 120, 120), 1, cv2.LINE_AA)
 
     y = 28
     x0 = max(280, w // 2 - 40)
@@ -228,20 +227,6 @@ def draw_drive_hud(
         cv2.putText(img, "  VPRAVO", (x0, y), font, 0.7, (255, 180, 0), 2, cv2.LINE_AA)
     else:
         cv2.putText(img, "  --- (net v kadre)", (x0, y), font, 0.65, (120, 120, 120), 1, cv2.LINE_AA)
-
-    if right_seen and right_y_low is not None:
-        y_dbg = y + 22
-        col = (0, 200, 255) if right_lowered else (140, 140, 140)
-        cv2.putText(
-            img,
-            f"  R y_low={right_y_low:.2f} need>={RIGHT_HAND_REVERSE_Y_MIN:.2f} back={'ON' if right_lowered else 'no'}",
-            (x0, y_dbg),
-            font,
-            0.45,
-            col,
-            1,
-            cv2.LINE_AA,
-        )
 
     # Угол наклона правой ладони (если была в кадре)
     if right_seen and steer_angle_deg is not None:
@@ -363,8 +348,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
         steer_angle_deg = None
         left_seen = False
         right_seen = False
-        right_lowered = False
-        right_y_low = None
 
         if result.hand_landmarks:
             n = len(result.hand_landmarks)
@@ -377,14 +360,13 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
                 if label == "Left":
                     left_seen = True
-                    left_state = classify_hand_openness(hand_lms)
+                    left_state = classify_left_gesture(hand_lms)
                 elif label == "Right":
                     right_seen = True
                     right_steer, steer_angle_deg = classify_steering(hand_lms)
-                    right_y_low, right_lowered = right_hand_lower_metrics(hand_lms)
 
         gesture_mode = compute_drive_mode(
-            left_seen, left_state, right_seen, right_steer, right_lowered
+            left_seen, left_state, right_seen, right_steer
         )
         drive_mode = _key_drive_mode if _key_drive_mode is not None else gesture_mode
 
@@ -413,8 +395,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
             right_seen,
             drive_mode=f"{drive_mode} State={car_state}",
             wifi_line=_wifi_hud,
-            right_lowered=right_lowered,
-            right_y_low=right_y_low,
             kb_mode=_key_drive_mode,
         )
 
